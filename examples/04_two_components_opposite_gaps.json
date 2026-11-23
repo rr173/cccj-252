@@ -1,0 +1,16 @@
+{
+  "round_id": "R1",
+  "locations": {
+    "LOC-MULTI": ["a", "b", "c", "d"]
+  },
+  "tickets": [
+    {"ticket_id": "ab1", "location": "LOC-MULTI", "round_id": "R1",
+     "labels": ["a", "b"], "quantity": 20},
+    {"ticket_id": "ab2", "location": "LOC-MULTI", "round_id": "R1",
+     "labels": ["a", "b"], "quantity": 30},
+    {"ticket_id": "cd1", "location": "LOC-MULTI", "round_id": "R1",
+     "labels": ["c", "d"], "quantity": 30},
+    {"ticket_id": "cd2", "location": "LOC-MULTI", "round_id": "R1",
+     "labels": ["c", "d"], "quantity": 20}
+  ]
+}

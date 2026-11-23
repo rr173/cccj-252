@@ -1,0 +1,14 @@
+{
+  "round_id": "R1",
+  "locations": {
+    "LOC-A": ["a", "b", "c"]
+  },
+  "tickets": [
+    {"ticket_id": "abc", "location": "LOC-A", "round_id": "R1",
+     "labels": ["a", "b", "c"], "quantity": 30},
+    {"ticket_id": "ab", "location": "LOC-A", "round_id": "R1",
+     "labels": ["a", "b"], "quantity": 20},
+    {"ticket_id": "c", "location": "LOC-A", "round_id": "R1",
+     "labels": ["c"], "quantity": 10}
+  ]
+}

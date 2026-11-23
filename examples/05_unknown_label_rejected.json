@@ -1,0 +1,10 @@
+{
+  "round_id": "R1",
+  "locations": {
+    "LOC-A": ["a", "b"]
+  },
+  "tickets": [
+    {"ticket_id": "T1", "location": "LOC-A", "round_id": "R1",
+     "labels": ["a", "ghost-label"], "quantity": 1}
+  ]
+}
