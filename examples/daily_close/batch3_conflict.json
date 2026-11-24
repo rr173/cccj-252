@@ -1,0 +1,7 @@
+{
+  "records": [
+    {"doc_no": "T-1001", "revision": 1, "type": "transfer",
+     "from_location": "A", "from_date": "2026-01-03",
+     "to_location": "B", "to_date": "2026-01-04", "quantity": 12}
+  ]
+}

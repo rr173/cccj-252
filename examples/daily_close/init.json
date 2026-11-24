@@ -1,0 +1,12 @@
+{
+  "item": "SKU-0001",
+  "closing_end": "2026-01-10",
+  "anchors": [
+    {"location": "A", "biz_date": "2026-01-01", "round": "R1",
+     "status": "accepted", "exact_total": 100},
+    {"location": "B", "biz_date": "2026-01-01", "round": "R1",
+     "status": "accepted", "exact_total": 0},
+    {"location": "B", "biz_date": "2026-01-06", "round": "R2",
+     "status": "accepted", "exact_total": 7}
+  ]
+}
