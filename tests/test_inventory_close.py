@@ -26,6 +26,7 @@ from inventory_close import (  # noqa: E402
     list_batches,
     list_versions,
     read_close,
+    read_close_at_batch,
 )
 from inventory_close.cli import main as cli_main  # noqa: E402
 
@@ -481,6 +482,151 @@ class ReadAndAuditTests(WorkspaceTestCase):
         self.assertNotEqual(self.close_map(), first)
 
 
+class CloseAtBatchTests(WorkspaceTestCase):
+    """按批次还原历史日结：当时件数、当前件数与差值（delta = 当前 − 当时）。"""
+
+    def setup_three_batches(self):
+        """批1：T-1 A→B 10（01-03 发货 / 01-04 收货）；
+        批2：T-2 B→A 4（01-07 发货 / 01-08 收货）；
+        批3：迟到更正 T-1 rev2，发货日 01-03 → 01-02（更早业务日）。"""
+        self.init_base()
+        r1 = import_batch(self.db, batch(
+            transfer("T-1", 1, "A", "2026-01-03", "B", "2026-01-04", 10)))
+        r2 = import_batch(self.db, batch(
+            transfer("T-2", 1, "B", "2026-01-07", "A", "2026-01-08", 4)))
+        r3 = import_batch(self.db, batch(
+            transfer("T-1", 2, "A", "2026-01-02", "B", "2026-01-04", 10)))
+        return r1["batch_id"], r2["batch_id"], r3["batch_id"]
+
+    def then_map(self, batch_id, **filters):
+        rows = read_close_at_batch(self.db, batch_id, **filters)["rows"]
+        return {(r["location"], r["biz_date"]): r for r in rows}
+
+    def test_batch_view_reflects_state_right_after_that_batch(self):
+        b1, _, _ = self.setup_three_batches()
+        rows = self.then_map(b1)
+        self.assertEqual(len(rows), 20)
+        # 批1 刚完成时的完整日结：A 01-03 起 90；B 01-04、01-05 为 10，锚点日 7
+        expected_then = {}
+        for d in range(1, 11):
+            day = f"2026-01-{d:02d}"
+            expected_then[("A", day)] = 100 if d <= 2 else 90
+            expected_then[("B", day)] = 0 if d <= 3 else (10 if d <= 5 else 7)
+        self.assertEqual({k: r["quantity_then"] for k, r in rows.items()}, expected_then)
+        # 与当前日结对照：批2 的 B→A 与批3 的迟到更正在批1 时都不存在
+        self.assertEqual(
+            [(r["quantity_then"], r["quantity_now"], r["delta"])
+             for r in (rows[("A", "2026-01-02")], rows[("A", "2026-01-08")],
+                       rows[("B", "2026-01-07")], rows[("B", "2026-01-04")])],
+            [(100, 90, -10), (90, 94, 4), (7, 3, -4), (10, 10, 0)])
+        # 锚点日永不被改写：当时与当前一致
+        self.assertEqual(rows[("B", "2026-01-06")]["quantity_then"], 7)
+        self.assertEqual(rows[("B", "2026-01-06")]["delta"], 0)
+
+    def test_late_correction_does_not_rewrite_earlier_batch_view(self):
+        _, b2, _ = self.setup_three_batches()
+        rows = self.then_map(b2)
+        # 批3 把 T-1 发货日改到 01-02：当前日结 A 01-02 = 90，
+        # 但批2 的历史视图仍还原当时展示的 100，可解释当时的出库/补货决定
+        row = rows[("A", "2026-01-02")]
+        self.assertEqual((row["quantity_then"], row["quantity_now"], row["delta"]),
+                         (100, 90, -10))
+        changed = sorted(k for k, r in rows.items() if r["delta"] != 0)
+        self.assertEqual(changed, [("A", "2026-01-02")])
+        # 当前日结仍是重述后的最新结果
+        self.assertEqual(self.qty("A", "2026-01-02"), 90)
+
+    def test_latest_batch_view_matches_current(self):
+        _, _, b3 = self.setup_three_batches()
+        out = read_close_at_batch(self.db, b3)
+        self.assertEqual(out["batch_id"], b3)
+        self.assertTrue(all(r["delta"] == 0 for r in out["rows"]))
+        self.assertEqual(
+            [(r["location"], r["biz_date"], r["quantity_then"]) for r in out["rows"]],
+            [(r["location"], r["biz_date"], r["quantity"])
+             for r in read_close(self.db)["rows"]])
+
+    def test_filters_and_ordering(self):
+        b1, _, _ = self.setup_three_batches()
+        out = read_close_at_batch(self.db, b1, location="B",
+                                  date_from="2026-01-03", date_to="2026-01-06")
+        self.assertEqual(
+            [(r["biz_date"], r["quantity_then"], r["quantity_now"]) for r in out["rows"]],
+            [("2026-01-03", 0, 0), ("2026-01-04", 10, 10),
+             ("2026-01-05", 10, 10), ("2026-01-06", 7, 7)])
+        # 全量结果按库位、业务日排序
+        keys = [(r["location"], r["biz_date"])
+                for r in read_close_at_batch(self.db, b1)["rows"]]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_unknown_batch_rejected(self):
+        self.init_base()
+        with self.assertRaises(WorkspaceStateError):  # 还没有任何批次
+            read_close_at_batch(self.db, 1)
+        r1 = import_batch(self.db, batch(
+            transfer("T-1", 1, "A", "2026-01-03", "B", "2026-01-04", 10)))
+        with self.assertRaises(WorkspaceStateError):
+            read_close_at_batch(self.db, r1["batch_id"] + 100)
+        # 批次号必须为正整数
+        for bad in (0, -1, "1", 1.5, True, None):
+            with self.assertRaises(InvalidRecordError, msg=repr(bad)):
+                read_close_at_batch(self.db, bad)
+
+    def test_invalid_date_range_rejected(self):
+        b1, _, _ = self.setup_three_batches()
+        with self.assertRaises(InvalidRecordError):  # from 晚于 to
+            read_close_at_batch(self.db, b1,
+                                date_from="2026-01-06", date_to="2026-01-04")
+        with self.assertRaises(InvalidRecordError):  # 日期格式
+            read_close_at_batch(self.db, b1, date_from="2026-1-4")
+        with self.assertRaises(InvalidRecordError):  # 无效日历日
+            read_close_at_batch(self.db, b1, date_to="2026-02-30")
+
+    def test_unknown_location_rejected(self):
+        b1, _, _ = self.setup_three_batches()
+        with self.assertRaises(WorkspaceStateError):
+            read_close_at_batch(self.db, b1, location="NOPE")
+        # 只有非 accepted 锚点的库位也不是已知库位
+        config = base_config()
+        config["anchors"].append(
+            {"location": "C", "biz_date": "2026-01-02", "round": "R1",
+             "status": "ambiguous", "exact_total": 5})
+        db2 = os.path.join(self._tmp.name, "ws2.db")
+        init_workspace(db2, config)
+        import_batch(db2, batch(transfer("T-1", 1, "A", "2026-01-03", "B", "2026-01-04", 10)))
+        with self.assertRaises(WorkspaceStateError):
+            read_close_at_batch(db2, 1, location="C")
+
+    def test_history_view_stable_across_later_batches(self):
+        """后续批次（含撤销与再更正）不改写较早批次的历史视图。"""
+        b1, b2, _ = self.setup_three_batches()
+        then_b1 = {k: r["quantity_then"] for k, r in self.then_map(b1).items()}
+        then_b2 = {k: r["quantity_then"] for k, r in self.then_map(b2).items()}
+        import_batch(self.db, batch(void("T-2", 2)))
+        import_batch(self.db, batch(
+            transfer("T-1", 3, "A", "2026-01-05", "B", "2026-01-05", 1)))
+        # 每次读取都重新打开工作区文件：历史视图在关闭重开后仍可读取且不变
+        self.assertEqual(
+            {k: r["quantity_then"] for k, r in self.then_map(b1).items()}, then_b1)
+        self.assertEqual(
+            {k: r["quantity_then"] for k, r in self.then_map(b2).items()}, then_b2)
+        # 当前日结已随新批次变化（T-1 rev3 整单替换为 01-05 发货 1 件）
+        self.assertEqual(self.qty("A", "2026-01-05"), 99)
+
+    def test_idempotent_resend_batch_view(self):
+        """幂等重送产生的空改动批也是已成功批次：其历史视图 = 当前日结。"""
+        _, _, b3 = self.setup_three_batches()
+        resend = import_batch(self.db, batch(
+            transfer("T-1", 1, "A", "2026-01-03", "B", "2026-01-04", 10)))
+        self.assertEqual(resend["versions_inserted"], 0)
+        rows = read_close_at_batch(self.db, resend["batch_id"])["rows"]
+        self.assertTrue(all(r["delta"] == 0 for r in rows))
+        # 与上一批之间没有任何改动：两批的历史视图一致
+        self.assertEqual(
+            {k: r["quantity_then"] for k, r in self.then_map(resend["batch_id"]).items()},
+            {k: r["quantity_then"] for k, r in self.then_map(b3).items()})
+
+
 class CliTests(WorkspaceTestCase):
     def run_cli(self, *argv, stdin_text=None):
         old_stdin = sys.stdin
@@ -530,6 +676,48 @@ class CliTests(WorkspaceTestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out["status"], "error")
         self.assertEqual(out["error_type"], "InvalidRecordError")
+
+    def test_cli_close_at_flow(self):
+        config_path = os.path.join(self._tmp.name, "init.json")
+        with open(config_path, "w", encoding="utf-8") as fh:
+            json.dump(base_config(), fh)
+        code, _ = self.run_cli("init", self.db, "--config", config_path)
+        self.assertEqual(code, 0)
+        # 批1：T-1 A→B 10（01-03 发货）；批2：迟到更正，发货日改为 01-02
+        for payload in (
+            batch(transfer("T-1", 1, "A", "2026-01-03", "B", "2026-01-04", 10)),
+            batch(transfer("T-1", 2, "A", "2026-01-02", "B", "2026-01-04", 10)),
+        ):
+            code, _ = self.run_cli("import", self.db, "--batch", "-",
+                                   stdin_text=json.dumps(payload))
+            self.assertEqual(code, 0)
+
+        code, out = self.run_cli("close-at", self.db, "--batch", "1")
+        self.assertEqual((code, out["batch_id"]), (0, 1))
+        row = [r for r in out["rows"]
+               if r["location"] == "A" and r["biz_date"] == "2026-01-02"][0]
+        self.assertEqual((row["quantity_then"], row["quantity_now"], row["delta"]),
+                         (100, 90, -10))
+
+        code, out = self.run_cli("close-at", self.db, "--batch", "1",
+                                 "--location", "B", "--from", "2026-01-04",
+                                 "--to", "2026-01-04")
+        self.assertEqual(code, 0)
+        self.assertEqual([(r["biz_date"], r["quantity_then"], r["quantity_now"])
+                          for r in out["rows"]], [("2026-01-04", 10, 10)])
+
+        # 未知批次 / 无效日期范围 / 不存在的库位：明确报错，退出码 2
+        code, out = self.run_cli("close-at", self.db, "--batch", "99")
+        self.assertEqual((code, out["status"], out["error_type"]),
+                         (2, "error", "WorkspaceStateError"))
+        code, out = self.run_cli("close-at", self.db, "--batch", "1",
+                                 "--from", "2026-01-06", "--to", "2026-01-04")
+        self.assertEqual((code, out["status"], out["error_type"]),
+                         (2, "error", "InvalidRecordError"))
+        code, out = self.run_cli("close-at", self.db, "--batch", "1",
+                                 "--location", "Z")
+        self.assertEqual((code, out["status"], out["error_type"]),
+                         (2, "error", "WorkspaceStateError"))
 
 
 if __name__ == "__main__":

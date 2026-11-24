@@ -5,6 +5,7 @@
     python3 -I run_close_cli.py init    WORKSPACE.db --config init.json
     python3 -I run_close_cli.py import  WORKSPACE.db --batch batch.json
     python3 -I run_close_cli.py close   WORKSPACE.db [--location A] [--from D] [--to D]
+    python3 -I run_close_cli.py close-at WORKSPACE.db --batch 2 [--location A] [--from D] [--to D]
     python3 -I run_close_cli.py anchors WORKSPACE.db
     python3 -I run_close_cli.py versions WORKSPACE.db [--doc T-1001]
     python3 -I run_close_cli.py batches WORKSPACE.db
@@ -61,6 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="date_from", help="起始业务日 YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", help="截止业务日 YYYY-MM-DD")
 
+    p = sub.add_parser("close-at", help="按批次还原历史日结，并与当前日结对照")
+    p.add_argument("db")
+    p.add_argument("--batch", type=int, required=True, help="已成功提交的批次号")
+    p.add_argument("--location", help="只看某个库位")
+    p.add_argument("--from", dest="date_from", help="起始业务日 YYYY-MM-DD")
+    p.add_argument("--to", dest="date_to", help="截止业务日 YYYY-MM-DD")
+
     p = sub.add_parser("anchors", help="列出盘点锚点")
     p.add_argument("db")
 
@@ -88,6 +96,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.command == "close":
             output = store.read_close(args.db, location=args.location,
                                       date_from=args.date_from, date_to=args.date_to)
+        elif args.command == "close-at":
+            output = store.read_close_at_batch(args.db, args.batch,
+                                               location=args.location,
+                                               date_from=args.date_from,
+                                               date_to=args.date_to)
         elif args.command == "anchors":
             output = store.list_anchors(args.db)
         elif args.command == "versions":

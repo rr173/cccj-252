@@ -19,6 +19,12 @@
 到下一盘点锚点之前（无下一锚点则到关账末日）；首锚点之前和锚点当天的腿不影响
 日结，不扫描对应区间。区间起点前一日的日结值作为基准，逐日累加重放当前生效腿，
 净值未变的行不報也不重写。
+
+按批次还原历史日结：以当前日结为基准，把晚于目标批次的 ``batch_changes`` 审计行
+按批号倒序逐一撤销（每行回到该批修改前的件数），即还原该批提交完成时工作区实际
+展示的日结，并与当前日结对照。批次写入与审计落在同一事务，历史视图永远对应一个
+完整提交的批次，不会读到批执行到一半的状态；后续批次只追加新审计行，即使补录
+更早业务日的迟到更正，也不改写较早批次对应的历史视图。
 """
 
 from __future__ import annotations
@@ -719,6 +725,104 @@ def read_close(db_path: str, location: Optional[str] = None,
         return {
             "item": meta["item"],
             "closing_end": meta["closing_end"],
+            "rows": rows,
+        }
+    finally:
+        conn.close()
+
+
+def read_close_at_batch(db_path: str, batch_id: int, location: Optional[str] = None,
+                        date_from: Optional[str] = None, date_to: Optional[str] = None) -> dict:
+    """按批次还原历史日结：该批提交完成时工作区展示的日结，与当前日结对照。
+
+    历史状态由审计表推出：以当前日结为基准，把晚于该批的 ``batch_changes``
+    按批号倒序撤销（每行回到该批修改前的件数）。还原结果永远对应一个完整
+    提交的批次；后续批次（哪怕补录更早业务日的迟到更正）只追加新审计行，
+    不改写较早批次的历史视图。
+
+    每行含当时件数 ``quantity_then``、当前件数 ``quantity_now`` 与差值
+    ``delta``（= 当前 − 当时），按库位、业务日排序；可按库位与业务日期
+    范围过滤。只接受已成功提交的批次；未知批次、无效日期范围或不存在的
+    库位明确报错，不返回看似成功的空结果。
+    """
+    conn = _open_existing(db_path)
+    try:
+        meta = _read_meta(conn)
+        if isinstance(batch_id, bool) or not isinstance(batch_id, int) or batch_id < 1:
+            raise InvalidRecordError(f"批次号必须为正整数，实际为 {batch_id!r}")
+        batch = conn.execute(
+            "SELECT batch_id, imported_at FROM batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if batch is None:
+            raise WorkspaceStateError(
+                f"批次不存在：{batch_id}（只接受已成功提交的批次）"
+            )
+        date_from_v = (_parse_date(date_from, "--from", InvalidRecordError)
+                       if date_from is not None else None)
+        date_to_v = (_parse_date(date_to, "--to", InvalidRecordError)
+                     if date_to is not None else None)
+        if date_from_v is not None and date_to_v is not None and date_from_v > date_to_v:
+            raise InvalidRecordError(
+                f"无效日期范围：--from {date_from_v.isoformat()} 晚于"
+                f" --to {date_to_v.isoformat()}"
+            )
+        known_locations = {
+            r[0] for r in conn.execute("SELECT DISTINCT location FROM daily_close")
+        }
+        if location is not None and location not in known_locations:
+            known_txt = "、".join(sorted(known_locations))
+            raise WorkspaceStateError(
+                f"库位不存在：{location!r}（已知库位：{known_txt}）"
+            )
+
+        cond, args = [], []
+        if location is not None:
+            cond.append("location = ?")
+            args.append(location)
+        if date_from_v is not None:
+            cond.append("biz_date >= ?")
+            args.append(date_from_v.isoformat())
+        if date_to_v is not None:
+            cond.append("biz_date <= ?")
+            args.append(date_to_v.isoformat())
+        where = " WHERE " + " AND ".join(cond) if cond else ""
+        and_cond = " AND " + " AND ".join(cond) if cond else ""
+
+        current = conn.execute(
+            "SELECT location, biz_date, quantity, anchor_date, anchor_round"
+            " FROM daily_close" + where + " ORDER BY location, biz_date",
+            args,
+        ).fetchall()
+        # 晚于该批的审计改动按批号倒序撤销：同一行被多批改过时，最后写入的
+        # 是批号最小（最接近该批）那批的修改前件数，即该批提交完成时的值。
+        later = conn.execute(
+            "SELECT location, biz_date, old_quantity FROM batch_changes"
+            " WHERE batch_id > ?" + and_cond + " ORDER BY batch_id DESC",
+            [batch_id] + args,
+        ).fetchall()
+        then_qty = {(loc, day): qty for loc, day, qty, _, _ in current}
+        for loc, day, old in later:
+            key = (loc, day)
+            if key in then_qty:
+                then_qty[key] = old
+        rows = [
+            {
+                "location": loc,
+                "biz_date": day,
+                "quantity_then": then_qty[(loc, day)],
+                "quantity_now": qty,
+                "delta": qty - then_qty[(loc, day)],
+                "anchor_date": a_date,
+                "anchor_round": a_round,
+            }
+            for loc, day, qty, a_date, a_round in current
+        ]
+        return {
+            "item": meta["item"],
+            "closing_end": meta["closing_end"],
+            "batch_id": batch[0],
+            "imported_at": batch[1],
             "rows": rows,
         }
     finally:
