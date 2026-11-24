@@ -10,6 +10,8 @@
     python3 -I run_close_cli.py versions WORKSPACE.db [--doc T-1001]
     python3 -I run_close_cli.py batches WORKSPACE.db
     python3 -I run_close_cli.py batch   WORKSPACE.db --id 2
+    python3 -I run_close_cli.py trace   WORKSPACE.db --location A \\
+        --date 2026-01-01 --cutoff 2026-01-10 --manifest manifest.json
 
 ``--config`` / ``--batch`` 为 ``-`` 时从标准输入读取 JSON。
 所有输出均为 JSON；业务错误以 ``{"status": "error", ...}`` 返回，退出码 2，
@@ -25,6 +27,7 @@ from typing import List, Optional
 
 from .errors import WorkspaceError
 from . import store
+from .trace import trace_transfers
 
 
 def _load_json(path: str) -> dict:
@@ -83,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("db")
     p.add_argument("--id", type=int, required=True, help="批次号")
 
+    p = sub.add_parser(
+        "trace", help="只读调拨追溯：一次盘点开启的存量现在到哪里复核"
+    )
+    p.add_argument("db")
+    p.add_argument("--location", required=True, help="起点盘点所在库位")
+    p.add_argument("--date", required=True, help="起点盘点业务日 YYYY-MM-DD")
+    p.add_argument("--cutoff", required=True,
+                   help="截至日 YYYY-MM-DD（含），不得晚于末个关账日")
+    p.add_argument("--manifest", required=True,
+                   help="作业顺位清单 JSON 路径，- 表示标准输入")
+
     return parser
 
 
@@ -109,6 +123,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             output = store.list_batches(args.db)
         elif args.command == "batch":
             output = store.get_batch(args.db, args.id)
+        elif args.command == "trace":
+            output = trace_transfers(
+                args.db, location=args.location, biz_date=args.date,
+                cutoff=args.cutoff, manifest=_load_json(args.manifest),
+            )
         else:  # pragma: no cover - argparse 已拦截
             raise WorkspaceError(f"未知命令：{args.command}")
     except WorkspaceError as exc:

@@ -1,0 +1,22 @@
+{
+  "records": [
+    {"doc_no": "T-1001", "revision": 1, "type": "transfer",
+     "from_location": "A", "from_date": "2026-01-02",
+     "to_location": "B", "to_date": "2026-01-02", "quantity": 2},
+    {"doc_no": "T-1002", "revision": 1, "type": "transfer",
+     "from_location": "B", "from_date": "2026-01-03",
+     "to_location": "C", "to_date": "2026-01-03", "quantity": 4},
+    {"doc_no": "T-1003", "revision": 1, "type": "transfer",
+     "from_location": "B", "from_date": "2026-01-04",
+     "to_location": "A", "to_date": "2026-01-04", "quantity": 1},
+    {"doc_no": "T-1004", "revision": 1, "type": "transfer",
+     "from_location": "A", "from_date": "2026-01-05",
+     "to_location": "C", "to_date": "2026-01-06", "quantity": 2},
+    {"doc_no": "T-1005", "revision": 1, "type": "transfer",
+     "from_location": "C", "from_date": "2026-01-07",
+     "to_location": "A", "to_date": "2026-01-08", "quantity": 3},
+    {"doc_no": "T-1006", "revision": 1, "type": "transfer",
+     "from_location": "C", "from_date": "2026-01-09",
+     "to_location": "B", "to_date": "2026-01-11", "quantity": 2}
+  ]
+}

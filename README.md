@@ -215,6 +215,10 @@ python3 -I run_close_cli.py versions ws.db [--doc T-1001]
 # 批次审计：每批改了哪些日结行
 python3 -I run_close_cli.py batches ws.db
 python3 -I run_close_cli.py batch ws.db --id 2
+
+# 只读调拨追溯：一次盘点开启的存量后来随哪些调拨发走、现在到哪里复核
+python3 -I run_close_cli.py trace ws.db --location A --date 2026-01-01 \
+  --cutoff 2026-01-10 --manifest manifest.json
 ```
 
 业务错误输出 `{"status": "error", "error_type": ..., "reason": ...}`，退出码 2，
@@ -268,6 +272,26 @@ python3 -I run_close_cli.py batch ws.db --id 2
 }
 ```
 
+### 作业顺位清单 JSON（trace 用）
+
+```json
+{
+  "entries": [
+    {"doc_no": "T-1001", "revision": 1, "side": "ship", "rank": 1},
+    {"doc_no": "T-1001", "revision": 1, "side": "recv", "rank": 2},
+    {"doc_no": "T-1002", "revision": 1, "ship": 1, "recv": 2}
+  ]
+}
+```
+
+- 每行给一条腿（`side` + `rank`），或用一行 `ship` / `recv` 同时给同一单号修订
+  的两侧顺位；两种写法等价，也可直接把数组作为清单。
+- 清单**只提供顺位**：发/收库位与日期一律取工作区生效版本，清单里的任何其它
+  字段都会被拒绝。
+- 必须恰好覆盖业务日不晚于截至日的全部现行生效调拨腿；同日顺位全仓唯一，
+  当天发收的调拨发货顺位须小于收货顺位。缺腿、重复、引用已失效修订/撤销版本、
+  包含范围外腿都明确报错（`InvalidRecordError`，退出码 2），不交付部分追溯结果。
+
 ## 小样例：一次跨盘点日的调拨更正
 
 `examples/daily_close/run_sample.sh` 完整演示（可直接运行）：
@@ -289,6 +313,69 @@ python3 -I run_close_cli.py batch ws.db --id 2
 cd examples/daily_close && ./run_sample.sh
 ```
 
+## 只读调拨追溯（trace）
+
+仓管知道每个库位最后有多少货，却不知道某次盘点确认的那批存量后来分别随哪些
+调拨发走、现在应该去哪里复核。`trace` 在**不改写任何盘点 / 调拨 / 日结数据**的
+前提下，把一次起点盘点开启的存量沿现行生效调拨追踪到截至日。
+
+### 归属规则
+
+- **起点**：指定库位 + 业务日的 `accepted` 盘点；起点件数 = 该盘点 `exact_total`。
+  起点必须是截至日已发生的盘点，截至日不得晚于工作区末个关账日。
+- **取用顺序**：每次发货先用该库位**最早进入、尚未用完**的存量，跨批取货保留
+  取用先后；收货时整批以收货时刻进入目的库位，批内仍保留原发货的取用顺序。
+- **来源不明补足**：库位缺多少就为这次发货补多少来源不明的货，排在实取到的货
+  之后；它也可随货到达下游，但绝不用将来的收货倒填。
+- **首次盘点前**不假定库位有开账存量，但已发生的收货照常进入。
+- **后续盘点**均发生在当天调拨结束后：盘前未发出的货中止来源追溯（计入
+  “盘点中止”），盘后按盘点数开始一份不可追溯的新存量；已发或在途的货不受影响。
+- **不重复计入**：经多次调拨的起点货只记在签发它的那次发货上；回到起点库位
+  也不再算作新增起点。报告按业务记录合并来源数量，零贡献不列。
+
+### 报告内容
+
+```json
+{
+  "status": "ok", "read_only": true,
+  "start": {"location": "A", "biz_date": "2026-01-01", "round": "R1", "quantity": 2},
+  "cutoff": "2026-01-10",
+  "shipments": [
+    {"doc_no": "T-1001", "revision": 1,
+     "from_location": "A", "from_date": "2026-01-02",
+     "to_location": "B", "to_date": "2026-01-02",
+     "quantity": 6, "origin_quantity": 2,
+     "sources": [{"source": "receipt", "doc_no": "T-0900", "revision": 1,
+                  "location": "A", "biz_date": "2026-01-01", "quantity": 2}]}
+  ],
+  "remaining": [{"location": "C", "quantity": 2}],
+  "in_flight": [{"doc_no": "T-1006", "revision": 1,
+                 "from_location": "C", "from_date": "2026-01-09",
+                 "to_location": "B", "to_date": "2026-01-11",
+                 "quantity": 1}],
+  "stopped_at_anchor": [{"location": "B", "biz_date": "2026-01-06",
+                         "round": "R2", "quantity": 1}],
+  "totals": {"start_quantity": 2, "remaining": 0, "in_flight": 1,
+             "stopped_at_anchor": 1, "destination_total": 2, "balanced": true}
+}
+```
+
+- `shipments`：含起点货的每一笔发货（单号、修订号、发/收库位与日期、
+  `origin_quantity` 是本次带走的起点件数），`sources` 是其中各有多少来自发货
+  库位的哪次入货（起点盘点 `anchor` 或某笔收货 `receipt`）。
+  日期排序、单号排序，**不随清单行序改变**。
+- `remaining` / `in_flight` / `stopped_at_anchor`：截至日的三类去向——仍在各
+  库位的起点件数、已发未收的各单起点件数、因后续盘点中止追溯的各盘点件数；三者和
+  `destination_total` 必须等于 `start_quantity`（`balanced`）。
+- 数量全程按整数批次片段推进，不按单件或逐条完整路径展开，拆开再汇合的多路
+  调拨不会撑大报告或工作状态。
+
+### 清单校验与错误
+
+清单缺腿、重复、引用已失效修订或撤销版本、包含不在范围内的腿，或起点不是
+截至日已发生的 `accepted` 盘点、截至日超过末个关账日，都输出
+`{"status": "error", ...}`、退出码 2，且不交付部分追溯结果。
+
 ## 小样例：按批次还原历史日结
 
 `examples/batch_history/run_sample.sh` 完整演示（可直接运行）：
@@ -309,10 +396,33 @@ cd examples/daily_close && ./run_sample.sh
 cd examples/batch_history && ./run_sample.sh
 ```
 
+## 小样例：只读调拨追溯
+
+`examples/trace/run_sample.sh` 完整演示（可直接运行）：
+
+1. **建账**：A/B/C 三个库位；A 起点盘点 `2026-01-01 R1 = 2` 件，
+   B 在 `2026-01-06` 有第二轮盘点。
+2. **A→B** `T-1001`：起点 2 件与 B 原有 4 件同批收货。
+3. **B→C** `T-1002`：B 先发 4 件，取的是 B 原有货 → 该发货不带起点货，
+   报告不列。
+4. **B→A** `T-1003`：1 件起点货绕回起点库位，不算新增；**A→C** `T-1004`
+   再发 2 件（1 件起点 + 1 件来源不明）。
+5. **B 盘点** `01-06 R2`：盘前仍在 B 的 1 件起点货中止追溯。
+6. **C→B** `T-1006`：发货 `01-09`、收货 `01-11`，截至 `01-10` 时 1 件起点货
+   仍在途。
+7. 截至 `2026-01-10`：在库 0 + 在途 1 + 盘点中止 1 = 起点 2 件。
+8. **只读性**：追溯前后 `close` 输出逐字节一致。
+9. **清单校验**：漏掉 `T-1006` 的发货腿被拒绝，退出码 2。
+
+```bash
+cd examples/trace && ./run_sample.sh
+```
+
 ## 测试
 
 ```bash
 python3 -I tests/test_inventory_close.py
+python3 -I tests/test_inventory_trace.py
 ```
 
 41 个用例覆盖：建账铺行与锚点约束、双端各自日期记账、跨盘点日更正、
@@ -323,17 +433,31 @@ python3 -I tests/test_inventory_close.py
 迟到更正不改写较早批次视图、空改动批、过滤与排序、未知批次/无效日期
 范围/未知库位报错），以及 CLI 全链路。
 
+`tests/test_inventory_trace.py` 另有 40 个用例：起点件数与逐笔发货来源、
+多跳只归最近一次入货、FIFO 与收货批内顺序（先 4 件别的后 2 件起点 → 先发
+4 件不带起点）、库位不足的来源不明补足、后续盘点中止与盘后新存量、起点
+在途、起点当天发货、大件数与多路拆并、清单缺腿/重复/失效修订/撤销/范围外
+/非正顺位/同日先发后收校验、报告顺序与清单行序无关，以及追溯只读且幂等的
+文件级校验。
+
+```bash
+python3 -I tests/test_inventory_trace.py
+```
+
 ## 目录结构（新增）
 
 ```
 inventory_close/
   errors.py         # 可区分的业务异常（配置/记录/冲突/状态）
   store.py          # 建账、批量导入、增量重算、读取与审计（单事务）
+  trace.py          # 只读调拨追溯（一致读取 + 批量片段 FIFO）
   cli.py            # JSON 进 / JSON 出
 tests/
   test_inventory_close.py
+  test_inventory_trace.py
 examples/
   daily_close/      # 跨盘点日更正小样例（init + 4 个批次 + run_sample.sh）
   batch_history/    # 按批次还原历史日结小样例（init + 3 个批次 + run_sample.sh）
+  trace/            # 只读调拨追溯小样例（init + 调拨 + 清单 + run_sample.sh）
 run_close_cli.py    # 顶层包装，保证 python -I 下也能导入本地包
 ```
